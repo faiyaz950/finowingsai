@@ -1,6 +1,7 @@
 import os
 import re
 import base64
+import logging
 from typing import Generator, Optional, List
 from google import genai
 from google.genai import types as genai_types
@@ -45,8 +46,11 @@ COMMODITY_KEYWORDS = {
     "sgb", "sovereign gold", "gold etf", "copper", "zinc", "natural gas",
 }
 
+GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
+GEMINI_FALLBACK_MODELS = ("gemini-flash-latest", "gemini-3.5-flash")
+
 MODEL_NAMES = {
-    "gemini": "Gemini 2.5 Flash + Search",
+    "gemini": "Gemini 3.6 Flash + Search",
     "grok": "Grok 3 Fast",
     "groq": "Groq Llama 3.3",
     "openai": "GPT-4o Mini",
@@ -64,6 +68,45 @@ MODEL_DESCRIPTIONS = {
 
 VALID_MODEL_IDS = {"auto", "gemini", "grok", "groq", "openai", "claude"}
 VISION_MODEL_IDS = {"auto", "gemini", "openai"}
+
+
+def _pretty_gemini_name(model_id: str, grounded: bool = False) -> str:
+    raw = (model_id or GEMINI_DEFAULT_MODEL).replace("models/", "").strip()
+    parts = raw.split("-")
+    if parts and parts[0].lower() == "gemini":
+        rest = []
+        for part in parts[1:]:
+            if part.isalpha():
+                rest.append(part.capitalize())
+            else:
+                rest.append(part)
+        name = "Gemini " + " ".join(rest)
+    else:
+        name = raw
+    if grounded and "+ Search" not in name:
+        name += " + Search"
+    return name
+
+
+def _extract_gemini_text(response) -> str:
+    """Read visible text parts and skip thought / thought_signature chunks."""
+    if not response:
+        return ""
+    texts = []
+    for cand in getattr(response, "candidates", None) or []:
+        content = getattr(cand, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            if getattr(part, "thought", False):
+                continue
+            text = getattr(part, "text", None)
+            if text:
+                texts.append(text)
+    if texts:
+        return "".join(texts)
+    try:
+        return getattr(response, "text", None) or ""
+    except Exception:
+        return ""
 
 
 def _kw_matches(kw: str, q: str) -> bool:
@@ -96,6 +139,11 @@ class ArjunAI:
     def __init__(self):
         gemini_key = os.getenv("GEMINI_API_KEY")
         self.gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
+        self.gemini_model = (os.getenv("GEMINI_MODEL") or GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
+        self.gemini_model_ids = [self.gemini_model]
+        for fallback in GEMINI_FALLBACK_MODELS:
+            if fallback not in self.gemini_model_ids:
+                self.gemini_model_ids.append(fallback)
 
         grok_key = os.getenv("GROK_API_KEY")
         self.grok = OpenAI(api_key=grok_key, base_url="https://api.x.ai/v1") if grok_key else None
@@ -130,8 +178,16 @@ class ArjunAI:
             )
         if agent_name == "openai" and ("invalid_api_key" in err_lower or "incorrect api key" in err_lower):
             return "⚠️ **OpenAI API key galat hai.** `.env` file mein `OPENAI_API_KEY` check karein."
-        if agent_name == "gemini" and "429" in err:
-            return None  # handled separately for auto mode
+        if agent_name == "gemini" and ("429" in err or "resource_exhausted" in err_lower):
+            return (
+                "⚠️ **Gemini API quota/rate limit hit ho gayi.** "
+                "Thodi der baad try karein, ya model selector se **Groq** choose karein."
+            )
+        if agent_name == "gemini" and ("404" in err or "not_found" in err_lower):
+            return (
+                "⚠️ **Gemini model available nahi hai.** "
+                f"`.env` mein `GEMINI_MODEL={GEMINI_DEFAULT_MODEL}` set karke backend restart karein."
+            )
         if agent_name == "openai" and "429" in err:
             return (
                 "⚠️ **OpenAI rate limit hit ho gayi.** Thodi der baad try karein, "
@@ -157,7 +213,12 @@ class ArjunAI:
         }]
         for agent_id in ("gemini", "openai", "grok", "groq"):
             if self._is_configured(agent_id):
-                label = self._openai_label() if agent_id == "openai" else MODEL_NAMES[agent_id]
+                if agent_id == "openai":
+                    label = self._openai_label()
+                elif agent_id == "gemini":
+                    label = _pretty_gemini_name(self.gemini_model, grounded=True)
+                else:
+                    label = MODEL_NAMES[agent_id]
                 models.append({
                     "id": agent_id,
                     "label": label,
@@ -297,41 +358,74 @@ class ArjunAI:
         contents.append(genai_types.Content(role="user", parts=parts))
         return contents
 
-    def _gemini_config(self, portfolio_context: Optional[str], market_context: Optional[str], question: str):
+    def _gemini_config(self, portfolio_context: Optional[str], market_context: Optional[str], question: str, enable_search: bool = False):
         search_note = ""
-        if needs_google_search(question):
+        tools = None
+        if enable_search:
             search_note = (
                 "\n\n🔍 GOOGLE SEARCH REQUIRED: Is sawaal ke liye pehle Google Search chalao — "
                 "latest news, IPO, NAV, RBI policy, earnings ya aaj ki market updates fetch karo. "
                 "Kam se kam 6-8 detailed points ke saath poora jawab do — kabhi beech mein mat ruko."
             )
-        return genai_types.GenerateContentConfig(
-            system_instruction=get_arjunai_prompt(portfolio_context, market_context) + search_note,
-            max_output_tokens=4096,
-            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-        )
+            tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+        kwargs = {
+            "system_instruction": get_arjunai_prompt(portfolio_context, market_context) + search_note,
+            "max_output_tokens": 8192,
+            "thinking_config": genai_types.ThinkingConfig(thinking_budget=1024),
+        }
+        if tools:
+            kwargs["tools"] = tools
+        return genai_types.GenerateContentConfig(**kwargs)
 
     def _gemini_meta(self, response) -> dict:
         sources = extract_grounding_sources(response)
         queries = extract_search_queries(response)
         return {"sources": sources, "search_queries": queries, "grounded": bool(sources or queries)}
 
+    def _gemini_should_retry_without_search(self, err: str) -> bool:
+        lower = err.lower()
+        return (
+            "429" in err
+            or "resource_exhausted" in lower
+            or "empty gemini response" in lower
+        )
+
+    def _gemini_is_missing_model(self, err: str) -> bool:
+        lower = err.lower()
+        return "404" in err or "not_found" in lower or "no longer available" in lower
+
     # ── Non-streaming (fallback / cache path) ────────────────────────────────
 
     def _try_gemini(self, question: str, history: list, portfolio_context: Optional[str] = None, market_context: Optional[str] = None, file_data: Optional[List[dict]] = None):
         if not self.gemini_client:
             raise Exception("Gemini not configured")
-        response = self.gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=self._build_gemini_contents(question, history, file_data),
-            config=self._gemini_config(portfolio_context, market_context, question),
-        )
-        meta = self._gemini_meta(response)
-        text = response.text or ""
-        if not text.strip():
-            raise Exception("Empty Gemini response")
-        model_label = MODEL_NAMES["gemini"] if meta.get("grounded") else "Gemini 2.5 Flash"
-        return text, model_label, meta
+
+        want_search = needs_google_search(question)
+        last_err: Optional[Exception] = None
+        for model_id in self.gemini_model_ids:
+            for enable_search in ([True, False] if want_search else [False]):
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=model_id,
+                        contents=self._build_gemini_contents(question, history, file_data),
+                        config=self._gemini_config(portfolio_context, market_context, question, enable_search),
+                    )
+                    text = _extract_gemini_text(response)
+                    if not text.strip():
+                        raise Exception("Empty Gemini response")
+                    meta = self._gemini_meta(response)
+                    meta["model_id"] = model_id
+                    return text, _pretty_gemini_name(model_id, bool(meta.get("grounded"))), meta
+                except Exception as e:
+                    last_err = e
+                    err = str(e)
+                    logging.warning("Gemini %s search=%s failed: %s", model_id, enable_search, err[:300])
+                    if enable_search and self._gemini_should_retry_without_search(err):
+                        continue
+                    if self._gemini_is_missing_model(err):
+                        break
+                    raise
+        raise last_err or Exception("Gemini request failed")
 
     def _try_grok(self, question: str, history: list, portfolio_context: Optional[str] = None):
         if not self.grok:
@@ -339,7 +433,7 @@ class ArjunAI:
         messages = [{"role": "system", "content": get_arjunai_prompt(portfolio_context)}]
         messages.extend(self._build_messages(question, history))
         response = self.grok.chat.completions.create(
-            model="grok-3-fast", messages=messages, max_tokens=1500,
+            model="grok-3-fast", messages=messages, max_tokens=4096,
         )
         return response.choices[0].message.content, MODEL_NAMES["grok"]
 
@@ -349,7 +443,7 @@ class ArjunAI:
         messages = [{"role": "system", "content": get_arjunai_prompt(portfolio_context)}]
         messages.extend(self._build_messages(question, history))
         response = self.groq.chat.completions.create(
-            model="llama-3.3-70b-versatile", messages=messages, max_tokens=1500,
+            model="llama-3.3-70b-versatile", messages=messages, max_tokens=4096,
         )
         return response.choices[0].message.content, MODEL_NAMES["groq"]
 
@@ -369,7 +463,7 @@ class ArjunAI:
         response = self.openai.chat.completions.create(
             model=self.openai_model,
             messages=messages,
-            max_tokens=4096 if file_data else 1500,
+            max_tokens=4096,
         )
         text = response.choices[0].message.content or ""
         if not text.strip():
@@ -381,7 +475,7 @@ class ArjunAI:
             raise Exception("Claude not configured")
         response = self.claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=1500,
+            max_tokens=4096,
             system=get_arjunai_prompt(portfolio_context),
             messages=self._build_messages(question, history),
         )
@@ -393,38 +487,58 @@ class ArjunAI:
         if not self.gemini_client:
             raise Exception("Gemini not configured")
 
-        config = self._gemini_config(portfolio_context, market_context, question)
         contents = self._build_gemini_contents(question, history, file_data)
-
-        # Google Search + tools / images: non-streaming is more reliable
+        want_search = needs_google_search(question)
         has_images = file_data and any(fd.get("is_image") for fd in file_data)
-        use_buffered = needs_google_search(question) or is_market_news_question(question) or has_images
+        use_buffered = want_search or is_market_news_question(question) or bool(has_images)
 
-        if use_buffered:
-            response = self.gemini_client.models.generate_content(
-                model="gemini-2.5-flash", contents=contents, config=config,
-            )
-            text = response.text or ""
-            if not text.strip():
-                raise Exception("Empty Gemini response")
-            meta = self._gemini_meta(response)
-            # Simulate typing — send in chunks so UI still streams
-            chunk_size = 48
-            for i in range(0, len(text), chunk_size):
-                yield text[i:i + chunk_size], None
-            yield "", {"agent": "gemini", **meta}
-            return
+        last_err: Optional[Exception] = None
+        for model_id in self.gemini_model_ids:
+            for enable_search in ([True, False] if want_search else [False]):
+                config = self._gemini_config(portfolio_context, market_context, question, enable_search)
+                try:
+                    if use_buffered or enable_search:
+                        response = self.gemini_client.models.generate_content(
+                            model=model_id, contents=contents, config=config,
+                        )
+                        text = _extract_gemini_text(response)
+                        if not text.strip():
+                            raise Exception("Empty Gemini response")
+                        meta = self._gemini_meta(response)
+                        meta["model_id"] = model_id
+                        chunk_size = 48
+                        for i in range(0, len(text), chunk_size):
+                            yield text[i:i + chunk_size], None
+                        yield "", {"agent": "gemini", **meta}
+                        return
 
-        response = self.gemini_client.models.generate_content_stream(
-            model="gemini-2.5-flash", contents=contents, config=config,
-        )
-        last_chunk = None
-        for chunk in response:
-            last_chunk = chunk
-            if chunk.text:
-                yield chunk.text, None
-        meta = self._gemini_meta(last_chunk)
-        yield "", {"agent": "gemini", **meta}
+                    response = self.gemini_client.models.generate_content_stream(
+                        model=model_id, contents=contents, config=config,
+                    )
+                    last_chunk = None
+                    any_text = False
+                    for chunk in response:
+                        last_chunk = chunk
+                        token = _extract_gemini_text(chunk)
+                        if token:
+                            any_text = True
+                            yield token, None
+                    if not any_text:
+                        raise Exception("Empty Gemini response")
+                    meta = self._gemini_meta(last_chunk)
+                    meta["model_id"] = model_id
+                    yield "", {"agent": "gemini", **meta}
+                    return
+                except Exception as e:
+                    last_err = e
+                    err = str(e)
+                    logging.warning("Gemini stream %s search=%s failed: %s", model_id, enable_search, err[:300])
+                    if enable_search and self._gemini_should_retry_without_search(err):
+                        continue
+                    if self._gemini_is_missing_model(err):
+                        break
+                    raise
+        raise last_err or Exception("Gemini request failed")
 
     def _stream_grok(self, question: str, history: list, portfolio_context: Optional[str] = None) -> Generator[str, None, None]:
         if not self.grok:
@@ -432,7 +546,7 @@ class ArjunAI:
         messages = [{"role": "system", "content": get_arjunai_prompt(portfolio_context)}]
         messages.extend(self._build_messages(question, history))
         stream = self.grok.chat.completions.create(
-            model="grok-3-fast", messages=messages, max_tokens=1500, stream=True,
+            model="grok-3-fast", messages=messages, max_tokens=4096, stream=True,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta.content
@@ -446,7 +560,7 @@ class ArjunAI:
         messages = [{"role": "system", "content": get_arjunai_prompt(portfolio_context)}]
         messages.extend(self._build_messages(question, history))
         stream = self.groq.chat.completions.create(
-            model="llama-3.3-70b-versatile", messages=messages, max_tokens=1500, stream=True,
+            model="llama-3.3-70b-versatile", messages=messages, max_tokens=4096, stream=True,
         )
         for chunk in stream:
             delta = chunk.choices[0].delta.content
@@ -487,7 +601,7 @@ class ArjunAI:
         stream = self.openai.chat.completions.create(
             model=self.openai_model,
             messages=messages,
-            max_tokens=1500,
+            max_tokens=4096,
             stream=True,
         )
         for chunk in stream:
@@ -501,7 +615,7 @@ class ArjunAI:
             raise Exception("Claude not configured")
         with self.claude.messages.stream(
             model="claude-haiku-4-5",
-            max_tokens=1500,
+            max_tokens=4096,
             system=get_arjunai_prompt(portfolio_context),
             messages=self._build_messages(question, history),
         ) as stream:
@@ -665,7 +779,10 @@ class ArjunAI:
                             yield token, None, None
                     agent = completion_meta.get("agent", agent_name)
                     if agent == "gemini":
-                        model_name = MODEL_NAMES["gemini"] if completion_meta.get("grounded") else "Gemini 2.5 Flash"
+                        model_name = _pretty_gemini_name(
+                            completion_meta.get("model_id") or self.gemini_model,
+                            bool(completion_meta.get("grounded")),
+                        )
                     elif agent == "openai":
                         model_name = self._openai_label()
                     else:
@@ -703,10 +820,13 @@ class ArjunAI:
                 agent = completion_meta.get("agent", agent_name)
                 if agent == "openai":
                     model_name = self._openai_label()
+                elif agent == "gemini":
+                    model_name = _pretty_gemini_name(
+                        completion_meta.get("model_id") or self.gemini_model,
+                        bool(completion_meta.get("grounded")),
+                    )
                 else:
                     model_name = MODEL_NAMES.get(agent, "Error")
-                if agent == "gemini" and not completion_meta.get("grounded"):
-                    model_name = "Gemini 2.5 Flash"
                 yield "", model_name, completion_meta
                 return
             except Exception as e:
@@ -727,9 +847,9 @@ class ArjunAI:
 
         if gemini_failed_quota and model_pref == "auto":
             yield (
-                "⚠️ **Gemini API ki daily limit (20 requests) khatam ho gayi hai.** "
+                "⚠️ **Gemini API quota/rate limit hit ho gayi.** "
                 "Google Search grounding abhi available nahi hai. "
-                "35-60 minute baad dobara try karein.\n\n"
+                "Thodi der baad dobara try karein.\n\n"
                 "Tab tak Yahoo Finance live data ke liye specific stock poochho "
                 "(jaise: *HDFC Bank ka current price?*), ya model selector se **Groq** choose karein.",
                 "Quota Limit",

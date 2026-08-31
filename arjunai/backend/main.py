@@ -1,20 +1,60 @@
 import json
 import base64
+import asyncio
 from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Iterator, AsyncIterator
 import os
 from dotenv import load_dotenv
 
 from ai_router import ArjunAI, detect_topic
 from cache import get_cached_response, set_cached_response
-from market_data import build_market_context, fetch_yahoo_quotes, needs_live_data
+from thinking_steps import generate_thinking_steps
+from market_data import build_market_context, build_chart_payload, fetch_yahoo_quotes, fetch_yahoo_history, needs_live_data
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 ALLOWED_FILE_TYPES = {"application/pdf", "text/plain", "text/csv"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+THINKING_STEP_DELAY = 0.58
+TOKEN_CHUNK_DELAY = 0.016
+TOKEN_CHUNK_SIZE = 36
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload) + "\n\n"
+
+
+def _chunk_text(text: str, size: int = TOKEN_CHUNK_SIZE) -> Iterator[str]:
+    """Yield text in small pieces so the UI can reveal the answer smoothly."""
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(i + size, n)
+        if end < n:
+            space = text.find(" ", end)
+            newline = text.find("\n", i, end + 24)
+            if newline != -1 and newline < end + 24:
+                end = newline + 1
+            elif space != -1 and space < end + 18:
+                end = space + 1
+        piece = text[i:end]
+        if piece:
+            yield piece
+        i = end
+
+
+async def _stream_thinking_steps(thinking_steps: list) -> AsyncIterator[str]:
+    for i, step in enumerate(thinking_steps):
+        yield _sse({
+            "type": "thinking",
+            "step": step,
+            "index": i,
+            "total": len(thinking_steps),
+        })
+        await asyncio.sleep(THINKING_STEP_DELAY)
+
 
 load_dotenv()
 
@@ -107,6 +147,18 @@ def health():
 @app.get("/api/models")
 def list_models(user_type: str = Query("free", description="free or pro")):
     return {"models": arjun.get_available_models(user_type)}
+
+
+@app.get("/api/chart/{symbol}")
+def get_chart_data(symbol: str, range_: str = Query("6mo", alias="range")):
+    """Historical OHLCV for stock chart rendering."""
+    sym = symbol.strip().upper()
+    if not sym or len(sym) > 15:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    data = fetch_yahoo_history(sym, range_)
+    if not data:
+        raise HTTPException(status_code=502, detail="Chart data fetch failed")
+    return data
 
 
 @app.get("/api/prices/stocks")
@@ -244,10 +296,19 @@ async def chat_stream(
     if cached:
         topic = detect_topic(question)
 
-        def cached_stream():
-            yield "data: " + json.dumps({"type": "start", "topic": topic}) + "\n\n"
-            yield "data: " + json.dumps({"type": "token", "content": cached}) + "\n\n"
-            yield "data: " + json.dumps({"type": "done", "model": "Cache", "topic": topic, "cached": True}) + "\n\n"
+        async def cached_stream():
+            thinking_steps = generate_thinking_steps(question)
+            yield _sse({"type": "start", "topic": topic})
+            await asyncio.sleep(0.18)
+            async for event in _stream_thinking_steps(thinking_steps):
+                yield event
+            for chunk in _chunk_text(cached):
+                yield _sse({"type": "token", "content": chunk})
+                await asyncio.sleep(TOKEN_CHUNK_DELAY)
+            yield _sse({
+                "type": "done", "model": "Cache", "topic": topic, "cached": True,
+                "thinking_steps": thinking_steps,
+            })
 
         return StreamingResponse(
             cached_stream(),
@@ -258,9 +319,20 @@ async def chat_stream(
     topic = detect_topic(question)
     user_type_str = user_type or "free"
     history_list = history if isinstance(history, list) else []
+    market_ctx = build_market_context(question)
+    thinking_steps = generate_thinking_steps(question, market_ctx)
+    chart_payload = build_chart_payload(question)
 
-    def generate():
-        yield "data: " + json.dumps({"type": "start", "topic": topic}) + "\n\n"
+    async def generate():
+        yield _sse({
+            "type": "start",
+            "topic": topic,
+            "chart_data": chart_payload,
+        })
+        await asyncio.sleep(0.18)
+
+        async for event in _stream_thinking_steps(thinking_steps):
+            yield event
 
         full_text = ""
         completed_model = None
@@ -276,7 +348,11 @@ async def chat_stream(
         ):
             if token:
                 full_text += token
-                yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
+                pieces = _chunk_text(token) if len(token) > TOKEN_CHUNK_SIZE else [token]
+                for piece in pieces:
+                    yield _sse({"type": "token", "content": piece})
+                    if len(token) > TOKEN_CHUNK_SIZE:
+                        await asyncio.sleep(TOKEN_CHUNK_DELAY)
             if model_done is not None:
                 completed_model = model_done
                 completion_meta = meta or {}
@@ -284,7 +360,7 @@ async def chat_stream(
         if completed_model and completed_model != "error" and full_text and not has_files and model_pref == "auto":
             set_cached_response(question, full_text)
 
-        yield "data: " + json.dumps({
+        yield _sse({
             "type": "done",
             "model": completed_model or "Error",
             "topic": topic,
@@ -292,7 +368,9 @@ async def chat_stream(
             "sources": completion_meta.get("sources", []),
             "search_queries": completion_meta.get("search_queries", []),
             "grounded": completion_meta.get("grounded", False),
-        }) + "\n\n"
+            "chart_data": chart_payload,
+            "thinking_steps": thinking_steps,
+        })
 
     return StreamingResponse(
         generate(),

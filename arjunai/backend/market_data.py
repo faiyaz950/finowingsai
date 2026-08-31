@@ -297,6 +297,101 @@ def _fmt_usd(val: Optional[float]) -> str:
     return f"${val:,.2f}"
 
 
+def fetch_yahoo_history(symbol: str, range_: str = "1mo") -> Optional[dict]:
+    """Fetch OHLCV history for chart rendering."""
+    yahoo_sym = _yahoo_symbol(symbol)
+    try:
+        resp = requests.get(
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{yahoo_sym}",
+            params={"interval": "1d", "range": range_},
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("chart", {}).get("result", [])
+        if not result:
+            return None
+
+        meta = result[0].get("meta", {})
+        timestamps = result[0].get("timestamp") or []
+        indicators = result[0].get("indicators", {}).get("quote", [{}])[0]
+        closes = indicators.get("close") or []
+        opens = indicators.get("open") or []
+        highs = indicators.get("high") or []
+        lows = indicators.get("low") or []
+        volumes = indicators.get("volume") or []
+
+        points = []
+        for i, ts in enumerate(timestamps):
+            close = closes[i] if i < len(closes) else None
+            if close is None:
+                continue
+            points.append({
+                "date": ts,
+                "open": opens[i] if i < len(opens) else close,
+                "high": highs[i] if i < len(highs) else close,
+                "low": lows[i] if i < len(lows) else close,
+                "close": close,
+                "volume": volumes[i] if i < len(volumes) else 0,
+            })
+
+        raw_sym = meta.get("symbol", yahoo_sym).replace(".NS", "")
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose") or price
+        change_pct = ((price - prev) / prev * 100) if prev and price else 0
+
+        return {
+            "symbol": raw_sym,
+            "name": meta.get("longName") or meta.get("shortName", raw_sym),
+            "currency": meta.get("currency", "INR"),
+            "price": price,
+            "change_pct": change_pct,
+            "change": (price - prev) if prev and price else 0,
+            "day_high": meta.get("regularMarketDayHigh"),
+            "day_low": meta.get("regularMarketDayLow"),
+            "fifty_two_week_high": meta.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low": meta.get("fiftyTwoWeekLow"),
+            "volume": meta.get("regularMarketVolume"),
+            "pe_ratio": meta.get("trailingPE"),
+            "market_cap": meta.get("marketCap"),
+            "points": points[-120:],
+        }
+    except Exception:
+        return None
+
+
+def build_chart_payload(question: str) -> Optional[dict]:
+    """Build chart metadata for the primary stock/crypto in the question."""
+    stock_syms = _detect_stock_symbols(question)
+    if stock_syms:
+        sym = stock_syms[0]
+        if sym.startswith("^"):
+            return None
+        data = fetch_yahoo_history(sym, "6mo")
+        if data:
+            return {"type": "stock", **data}
+        return None
+
+    crypto_ids = _detect_crypto_ids(question)
+    if crypto_ids:
+        quotes = fetch_crypto_quotes(crypto_ids[:1])
+        if quotes:
+            coin_id = crypto_ids[0]
+            q = quotes[coin_id]
+            return {
+                "type": "crypto",
+                "symbol": q.get("symbol", coin_id.upper()),
+                "name": q.get("name", coin_id),
+                "currency": "USD",
+                "price": q.get("price_usd"),
+                "change_pct": q.get("change_24h_pct", 0),
+                "day_high": q.get("high_24h"),
+                "day_low": q.get("low_24h"),
+                "market_cap": q.get("market_cap_usd"),
+            }
+    return None
+
+
 def build_market_context(question: str) -> str:
     """Fetch live quotes for symbols mentioned in the question."""
     if not needs_live_data(question):

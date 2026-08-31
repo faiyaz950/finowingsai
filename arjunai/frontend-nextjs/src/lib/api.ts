@@ -1,4 +1,4 @@
-import type { ChatRequest, ChatResponse, Topic, Attachment, AIModelOption, UserType } from "./types";
+import type { ChatRequest, ChatResponse, Topic, Attachment, AIModelOption, UserType, ChartData } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
 
@@ -24,11 +24,19 @@ export async function sendMessage(payload: ChatRequest): Promise<ChatResponse> {
 
 export interface StreamCallbacks {
   onToken: (token: string) => void;
+  onThinking?: (step: string, index: number, total: number) => void;
+  onStart?: (meta: { topic: Topic; thinkingSteps?: string[]; chartData?: ChartData | null }) => void;
   onDone: (
     model: string,
     topic: Topic,
     cached: boolean,
-    extras?: { sources?: Array<{ title: string; url: string }>; searchQueries?: string[]; grounded?: boolean },
+    extras?: {
+      sources?: Array<{ title: string; url: string }>;
+      searchQueries?: string[];
+      grounded?: boolean;
+      chartData?: ChartData | null;
+      thinkingSteps?: string[];
+    },
   ) => void;
   onError: (msg: string) => void;
 }
@@ -105,7 +113,19 @@ export async function sendMessageStream(
 
       try {
         const event = JSON.parse(raw);
-        if (event.type === "token") {
+        if (event.type === "start") {
+          callbacks.onStart?.({
+            topic: (event.topic as Topic) ?? "general",
+            thinkingSteps: (event.thinking_steps as string[]) ?? [],
+            chartData: (event.chart_data as ChartData | null) ?? null,
+          });
+        } else if (event.type === "thinking") {
+          callbacks.onThinking?.(
+            event.step as string,
+            event.index as number,
+            event.total as number,
+          );
+        } else if (event.type === "token") {
           callbacks.onToken(event.content as string);
         } else if (event.type === "done") {
           callbacks.onDone(
@@ -116,6 +136,8 @@ export async function sendMessageStream(
               sources: (event.sources as Array<{ title: string; url: string }>) ?? [],
               searchQueries: (event.search_queries as string[]) ?? [],
               grounded: Boolean(event.grounded),
+              chartData: (event.chart_data as ChartData | null) ?? null,
+              thinkingSteps: (event.thinking_steps as string[]) ?? [],
             },
           );
         } else if (event.type === "error") {
@@ -148,7 +170,7 @@ export async function fetchAvailableModels(userType: UserType = "free"): Promise
 function getDefaultModels(): AIModelOption[] {
   return [
     { id: "auto", label: "Auto (Smart)", description: "Pehle Gemini, phir backup", available: true },
-    { id: "gemini", label: "Gemini 2.5 Flash + Search", description: "Google Search + Vision", available: true },
+    { id: "gemini", label: "Gemini 3.6 Flash + Search", description: "Google Search + Vision", available: true },
     { id: "openai", label: "GPT-4o Mini", description: "OpenAI — reasoning + vision", available: true },
     { id: "groq", label: "Groq Llama 3.3", description: "Free & fast", available: true },
   ];

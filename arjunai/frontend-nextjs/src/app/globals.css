@@ -81,13 +81,90 @@ html, body {
 .prose-dark tr:hover td { background: rgba(136,136,136,0.04); }
 .prose-dark hr { border: none; border-top: 1px solid #2a2a3a; margin: 1em 0; }
 
+/* Welcome screen hero */
+.welcome-screen {
+  -webkit-overflow-scrolling: touch;
+}
+
+.welcome-screen-inner {
+  min-height: min(100%, 100dvh);
+}
+
+.welcome-logo-wrap img {
+  width: 44px !important;
+  height: 44px !important;
+}
+
+@media (min-width: 640px) {
+  .welcome-logo-wrap img {
+    width: 52px !important;
+    height: 52px !important;
+  }
+}
+
+@media (min-width: 768px) {
+  .welcome-logo-wrap img {
+    width: 60px !important;
+    height: 60px !important;
+  }
+}
+
+.welcome-tabs {
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+}
+
+.welcome-tab {
+  scroll-snap-align: start;
+  min-width: max(33%, 110px);
+}
+
+@media (min-width: 640px) {
+  .welcome-tab {
+    min-width: 0;
+  }
+}
+
+.welcome-suggestion {
+  touch-action: manipulation;
+}
+
+@media (max-width: 639px) {
+  .welcome-hero {
+    border-radius: 1rem;
+  }
+}
+
+/* Thinking pad & stock cards */
+.prose-dark ol { counter-reset: section; padding-left: 0; list-style: none; }
+.prose-dark ol > li { counter-increment: section; padding-left: 0; margin-bottom: 0.6em; }
+.prose-dark ol > li::before {
+  content: counter(section) ") ";
+  color: #9b8cff;
+  font-weight: 700;
+  margin-right: 0.25em;
+}
+
 /* Typing cursor */
 @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
 .typing-cursor::after { content: "▋"; display: inline; animation: blink 1s step-end infinite; color: #888888; margin-left: 1px; }
+.thinking-caret::after { content: "▍"; display: inline; animation: blink 0.9s step-end infinite; color: #9b8cff; margin-left: 1px; }
 
 /* Animations */
 @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .fade-in-up { animation: fadeInUp 0.25s ease-out forwards; }
+.thinking-step { animation: fadeInUp 0.3s ease-out forwards; }
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-in-up,
+  .thinking-step,
+  .fade-in,
+  .shimmer,
+  .typing-cursor::after,
+  .thinking-caret::after {
+    animation: none !important;
+  }
+}
 
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .fade-in { animation: fadeIn 0.2s ease-out forwards; }
@@ -149,4 +226,16 @@ html, body {
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+/* Tonal card elevation — lifted surface + border, no drop shadow */
+.card-elevated {
+  background-color: var(--bg-card);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.045) 0%,
+    rgba(255, 255, 255, 0) 42%
+  );
+  border: 1px solid var(--border);
+  box-shadow: none !important;
 }

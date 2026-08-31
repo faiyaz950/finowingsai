@@ -5,25 +5,20 @@ interface Props {
   cached?: boolean;
 }
 
+const GEMINI_STYLE = {
+  icon: "✦",
+  color: "#60a5fa",
+  bg: "rgba(96,165,250,0.08)",
+  border: "rgba(96,165,250,0.2)",
+};
+
 const MODEL_META: Record<string, { icon: string; color: string; bg: string; border: string }> = {
-  "Gemini 2.0 Flash": {
-    icon: "✦",
-    color: "#60a5fa",
-    bg: "rgba(96,165,250,0.08)",
-    border: "rgba(96,165,250,0.2)",
-  },
-  "Gemini 2.5 Flash": {
-    icon: "✦",
-    color: "#60a5fa",
-    bg: "rgba(96,165,250,0.08)",
-    border: "rgba(96,165,250,0.2)",
-  },
-  "Gemini 2.5 Flash + Search": {
-    icon: "✦",
-    color: "#60a5fa",
-    bg: "rgba(96,165,250,0.08)",
-    border: "rgba(96,165,250,0.2)",
-  },
+  "Gemini 2.0 Flash": GEMINI_STYLE,
+  "Gemini 2.5 Flash": GEMINI_STYLE,
+  "Gemini 2.5 Flash + Search": GEMINI_STYLE,
+  "Gemini 3.6 Flash": GEMINI_STYLE,
+  "Gemini 3.6 Flash + Search": GEMINI_STYLE,
+  "Gemini Flash Latest": GEMINI_STYLE,
   "Grok 3 Fast": {
     icon: "𝕏",
     color: "#34d399",
@@ -87,12 +82,16 @@ const MODEL_META: Record<string, { icon: string; color: string; bg: string; bord
 };
 
 export default function ModelBadge({ model, cached }: Props) {
-  const meta = MODEL_META[model] ?? {
-    icon: "AI",
-    color: "#888888",
-    bg: "rgba(136,136,136,0.08)",
-    border: "rgba(136,136,136,0.2)",
-  };
+  const meta =
+    MODEL_META[model] ??
+    (model.startsWith("Gemini")
+      ? GEMINI_STYLE
+      : {
+          icon: "AI",
+          color: "#888888",
+          bg: "rgba(136,136,136,0.08)",
+          border: "rgba(136,136,136,0.2)",
+        });
 
   return (
     <div className="flex items-center gap-1.5 mt-2">

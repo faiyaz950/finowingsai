@@ -6,6 +6,7 @@ import type { Message, Conversation, UserType, Topic, Attachment, AIModelId, AIM
 import { TOPIC_CONFIG } from "@/lib/types";
 import { sendMessageStream, fetchAvailableModels } from "@/lib/api";
 import { getPortfolioAIContext } from "@/lib/portfolio";
+import { parseFollowUps } from "@/lib/parseResponse";
 import { useAuth } from "@/context/AuthContext";
 import Sidebar from "@/components/Sidebar";
 import ChatMessage from "@/components/ChatMessage";
@@ -47,8 +48,16 @@ function loadConversations(): Conversation[] {
 
 function saveConversations(convs: Conversation[]) {
   try {
-    // Keep only last 50 conversations to avoid localStorage bloat
-    localStorage.setItem(CONV_KEY, JSON.stringify(convs.slice(0, 50)));
+    const trimmed = convs.slice(0, 50).map((c) => ({
+      ...c,
+      messages: c.messages.map((m) => ({
+        ...m,
+        isStreaming: false,
+        thinkingActive: false,
+        revealLive: false,
+      })),
+    }));
+    localStorage.setItem(CONV_KEY, JSON.stringify(trimmed));
   } catch {
     // localStorage full — ignore
   }
@@ -275,6 +284,9 @@ export default function HomePage() {
       content: "",
       timestamp: new Date(),
       isStreaming: true,
+      thinkingSteps: [],
+      thinkingActive: true,
+      revealLive: true,
     };
 
     // Store for retry
@@ -332,6 +344,57 @@ export default function HomePage() {
           preferred_model: effectiveModel,
         },
         {
+          onStart: (meta) => {
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === convId
+                  ? {
+                      ...c,
+                      topic: meta.topic,
+                      messages: c.messages.map((m) =>
+                        m.id === aiMsgId
+                          ? {
+                              ...m,
+                              topic: meta.topic,
+                              thinkingActive: true,
+                              chartData: meta.chartData ?? m.chartData ?? null,
+                            }
+                          : m,
+                      ),
+                    }
+                  : c,
+              )
+            );
+            scrollToBottom();
+          },
+          onThinking: (step, index) => {
+            if (!step?.trim()) return;
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === convId
+                  ? {
+                      ...c,
+                      messages: c.messages.map((m) => {
+                        if (m.id !== aiMsgId) return m;
+                        const steps = (m.thinkingSteps ?? []).filter((s) => s.trim().length > 0);
+                        const next = [...steps];
+                        if (index < next.length) {
+                          next[index] = step;
+                        } else {
+                          next.push(step);
+                        }
+                        return {
+                          ...m,
+                          thinkingSteps: next,
+                          thinkingActive: true,
+                        };
+                      }),
+                    }
+                  : c,
+              )
+            );
+            scrollToBottom();
+          },
           onToken: (token) => {
             setConversations((prev) =>
               prev.map((c) =>
@@ -340,7 +403,7 @@ export default function HomePage() {
                       ...c,
                       messages: c.messages.map((m) =>
                         m.id === aiMsgId
-                          ? { ...m, content: m.content + token }
+                          ? { ...m, content: m.content + token, thinkingActive: false }
                           : m,
                       ),
                     }
@@ -356,20 +419,25 @@ export default function HomePage() {
                   ? {
                       ...c,
                       topic,
-                      messages: c.messages.map((m) =>
-                        m.id === aiMsgId
-                          ? {
-                              ...m,
-                              model,
-                              topic,
-                              cached,
-                              isStreaming: false,
-                              sources: extras?.sources,
-                              searchQueries: extras?.searchQueries,
-                              grounded: extras?.grounded,
-                            }
-                          : m,
-                      ),
+                      messages: c.messages.map((m) => {
+                        if (m.id !== aiMsgId) return m;
+                        const parsed = parseFollowUps(m.content);
+                        return {
+                          ...m,
+                          content: parsed.content,
+                          followUps: parsed.followUps,
+                          model,
+                          topic,
+                          cached,
+                          isStreaming: false,
+                          thinkingActive: false,
+                          thinkingSteps: extras?.thinkingSteps ?? m.thinkingSteps,
+                          chartData: extras?.chartData ?? m.chartData,
+                          sources: extras?.sources,
+                          searchQueries: extras?.searchQueries,
+                          grounded: extras?.grounded,
+                        };
+                      }),
                     }
                   : c,
               )
@@ -580,8 +648,7 @@ export default function HomePage() {
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setProfileOpen(false)} />
                   <div
-                    className="absolute right-0 top-full mt-2 w-56 rounded-2xl overflow-hidden z-20 fade-in"
-                    style={{ background: "#161616", border: "1px solid #2a2a2a", boxShadow: "0 16px 40px rgba(0,0,0,0.5)" }}
+                    className="absolute right-0 top-full mt-2 w-56 rounded-2xl overflow-hidden z-20 fade-in card-elevated"
                   >
                     <div className="px-4 py-3.5" style={{ borderBottom: "1px solid #2a2a3a" }}>
                       <div className="flex items-center gap-3">
@@ -638,7 +705,7 @@ export default function HomePage() {
           ) : (
             <div className="w-full px-6 md:px-10 lg:px-14 py-6">
               {messages.map((msg) => (
-                <ChatMessage key={msg.id} message={msg} />
+                <ChatMessage key={msg.id} message={msg} onFollowUp={handleSend} />
               ))}
               <div ref={messagesEndRef} />
             </div>

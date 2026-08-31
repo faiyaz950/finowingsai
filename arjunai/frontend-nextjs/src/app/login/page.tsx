@@ -121,7 +121,7 @@ export default function LoginPage() {
 
       {/* ── Right panel ── */}
       <div className="flex-1 flex items-center justify-center px-6 py-12">
-        <div className="w-full max-w-sm">
+        <div className="card-elevated w-full max-w-sm rounded-2xl p-6 sm:p-8">
 
           {/* Mobile brand */}
           <div className="mb-10 lg:hidden">

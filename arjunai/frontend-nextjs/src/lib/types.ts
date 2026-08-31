@@ -20,6 +20,33 @@ export interface Attachment {
   file?: File; // actual file for upload
 }
 
+export interface ChartPoint {
+  date: number;
+  open?: number;
+  high?: number;
+  low?: number;
+  close: number;
+  volume?: number;
+}
+
+export interface ChartData {
+  type: "stock" | "crypto";
+  symbol: string;
+  name: string;
+  currency?: string;
+  price?: number;
+  change_pct?: number;
+  change?: number;
+  day_high?: number;
+  day_low?: number;
+  fifty_two_week_high?: number;
+  fifty_two_week_low?: number;
+  volume?: number;
+  pe_ratio?: number;
+  market_cap?: number;
+  points?: ChartPoint[];
+}
+
 export interface Message {
   id: string;
   role: "user" | "assistant";
@@ -33,6 +60,11 @@ export interface Message {
   searchQueries?: string[];
   grounded?: boolean;
   attachments?: Attachment[];
+  thinkingSteps?: string[];
+  thinkingActive?: boolean;
+  revealLive?: boolean;
+  chartData?: ChartData | null;
+  followUps?: string[];
 }
 
 export interface Conversation {

@@ -1,31 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import AddHoldingModal from "@/components/portfolio/AddHoldingModal";
-import ConnectPortfolioModal from "@/components/portfolio/ConnectPortfolioModal";
 import DonutChart from "@/components/portfolio/DonutChart";
+import FileCard from "@/components/portfolio/FileCard";
 import HoldingCard from "@/components/portfolio/HoldingCard";
+import { CHART_COLORS, PnlByHoldingChart, TopHoldingsChart } from "@/components/portfolio/PortfolioCharts";
 import Logo from "@/components/Logo";
+import { parsePortfolioFile } from "@/lib/portfolioFileImport";
 import {
-  addHolding,
   buildPortfolioPrompt,
-  buildPortfolioAIContext,
   calcSummary,
-  clearAllHoldings,
+  clearPortfolio,
   fmtINR,
   fmtPct,
-  getPortfolioAIContext,
-  getPortfolioSourceMeta,
+  importPortfolioFile,
   loadHoldings,
-  loadConnectedBroker,
-  removeHolding,
-  savePortfolioAIContext,
-  syncPortfolioAIContext,
-  type ConnectedBroker,
+  loadPortfolioFiles,
+  rebuildPortfolioAIContext,
+  removePortfolioFile,
   type Holding,
+  type PortfolioFile,
   type PricedHolding,
-  type PortfolioSourceMeta,
 } from "@/lib/portfolio";
 import {
   fetchCryptoPrices,
@@ -33,6 +29,19 @@ import {
   getUsdInrRate,
   type PriceResult,
 } from "@/lib/priceApi";
+
+const ACCEPTED_EXTENSIONS = ["csv", "txt", "xlsx", "xls", "pdf"];
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const MAX_FILES_PER_UPLOAD = 5;
+
+const AI_SUGGESTIONS = [
+  "Meri portfolio diversification kaisi hai?",
+  "Sabse zyada risk kis holding mein hai?",
+  "Portfolio rebalance karna chahiye toh kya badlun?",
+  "Mere portfolio par tax ka kya impact hoga?",
+];
+
+type UploadStatus = "idle" | "parsing" | "success" | "error";
 
 function toPricedHolding(
   h: Holding,
@@ -60,7 +69,7 @@ function toPricedHolding(
 }
 
 const StatCard = ({ label, value, sub, color, icon }: { label: string; value: string; sub?: string; color?: string; icon: string }) => (
-  <div className="rounded-2xl p-5 flex flex-col gap-2" style={{ background: "#13131c", border: "1px solid #1e1e2a" }}>
+  <div className="card-elevated rounded-2xl p-5 flex flex-col gap-2">
     <div className="flex items-center justify-between">
       <span className="text-xs font-medium uppercase tracking-wider" style={{ color: "#5a5a72" }}>{label}</span>
       <span className="text-base">{icon}</span>
@@ -70,26 +79,36 @@ const StatCard = ({ label, value, sub, color, icon }: { label: string; value: st
   </div>
 );
 
+const SectionTitle = ({ children }: { children: React.ReactNode }) => (
+  <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "#5a5a72" }}>{children}</p>
+);
+
 export default function PortfolioPage() {
   const router = useRouter();
+  const [files, setFiles] = useState<PortfolioFile[]>([]);
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [priced, setPriced] = useState<PricedHolding[]>([]);
   const [usdInr, setUsdInr] = useState(84);
   const [loadingPrices, setLoadingPrices] = useState(true);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [showConnectModal, setShowConnectModal] = useState(false);
-  const [connectedBroker, setConnectedBroker] = useState<ConnectedBroker | null>(null);
-  const [sourceMeta, setSourceMeta] = useState<PortfolioSourceMeta | null>(null);
-  const [hasAIContext, setHasAIContext] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeTab, setActiveTab] = useState<"all" | "stock" | "crypto" | "mf">("all");
+  const [upload, setUpload] = useState<{ status: UploadStatus; message: string }>({ status: "idle", message: "" });
+  const [dragActive, setDragActive] = useState(false);
+  const [askText, setAskText] = useState("");
+
+  const fileRef = useRef<HTMLInputElement>(null);
+  const dragCounter = useRef(0);
+
+  const reloadData = useCallback(() => {
+    setFiles(loadPortfolioFiles());
+    setHoldings(loadHoldings());
+  }, []);
 
   useEffect(() => {
-    setHoldings(loadHoldings());
-    setConnectedBroker(loadConnectedBroker());
-    setSourceMeta(getPortfolioSourceMeta());
-    setHasAIContext(!!getPortfolioAIContext());
-  }, []);
+    reloadData();
+  }, [reloadData]);
+
+  // ── Live prices ───────────────────────────────────────────────────────────
 
   const refreshPrices = useCallback(async (items: Holding[]) => {
     setLoadingPrices(true);
@@ -124,64 +143,197 @@ export default function PortfolioPage() {
     refreshPrices(holdings);
   }, [holdings, refreshKey, refreshPrices]);
 
+  // Live prices aane ke baad AI context ko fresh numbers ke saath rebuild karo
   useEffect(() => {
     if (loadingPrices || !holdings.length) return;
     const ready = priced.some((p) => !p.priceLoading);
     if (!ready) return;
-    syncPortfolioAIContext(priced, usdInr);
-    setHasAIContext(true);
-    setSourceMeta(getPortfolioSourceMeta());
+    rebuildPortfolioAIContext(priced, usdInr);
   }, [priced, loadingPrices, usdInr, holdings.length]);
 
-  const summary = useMemo(() => calcSummary(priced), [priced]);
+  // ── File upload ───────────────────────────────────────────────────────────
 
-  const chartSegments = useMemo(() => [
-    { label: "Stocks", value: summary.stocksValueINR, color: "#10b981" },
-    { label: "Crypto", value: summary.cryptoValueINR, color: "#f59e0b" },
-    { label: "Mutual Funds", value: summary.mfValueINR, color: "#7c6ff7" },
-  ], [summary]);
+  const handleFiles = useCallback(async (list: FileList | File[]) => {
+    const selected = Array.from(list).slice(0, MAX_FILES_PER_UPLOAD);
+    if (!selected.length) return;
 
-  const handleAdd = (h: Omit<Holding, "id" | "addedAt">) => {
-    addHolding(h);
-    setHoldings(loadHoldings());
-    setShowAddModal(false);
+    setUpload({
+      status: "parsing",
+      message: selected.length > 1
+        ? `${selected.length} files process ho rahi hain…`
+        : `"${selected[0].name}" process ho rahi hai…`,
+    });
+
+    let holdingsAdded = 0;
+    let docsConnected = 0;
+    let replaced = 0;
+    const failed: string[] = [];
+
+    for (const file of selected) {
+      const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+      if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+        failed.push(`${file.name} — format support nahi (CSV, Excel, PDF)`);
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        failed.push(`${file.name} — 10MB se badi hai`);
+        continue;
+      }
+      try {
+        const result = await parsePortfolioFile(file);
+        if (!result.holdingsReady.length && !result.rawText?.trim()) {
+          failed.push(`${file.name} — ${result.errors[0] ?? "koi data nahi mila"}`);
+          continue;
+        }
+        const imported = importPortfolioFile(result, file.size);
+        if (imported.holdingsAdded > 0) holdingsAdded += imported.holdingsAdded;
+        else docsConnected++;
+        if (imported.replacedExisting) replaced++;
+      } catch {
+        failed.push(`${file.name} — process nahi ho payi`);
+      }
+    }
+
+    reloadData();
+
+    if (!holdingsAdded && !docsConnected) {
+      setUpload({ status: "error", message: failed.join(" · ") || "File process nahi ho payi" });
+      return;
+    }
+
+    const parts: string[] = [];
+    if (holdingsAdded) parts.push(`✓ ${holdingsAdded} holdings import ho gayi`);
+    if (docsConnected) parts.push(`✓ ${docsConnected} document AI se connect ho gaya`);
+    if (replaced) parts.push("purani file replace hui");
+    if (failed.length) parts.push(`skip: ${failed.join(", ")}`);
+    setUpload({ status: "success", message: parts.join(" · ") });
+  }, [reloadData]);
+
+  // Success banner auto-dismiss
+  useEffect(() => {
+    if (upload.status !== "success") return;
+    const t = setTimeout(() => setUpload({ status: "idle", message: "" }), 6000);
+    return () => clearTimeout(t);
+  }, [upload]);
+
+  const openFilePicker = () => fileRef.current?.click();
+
+  // ── Page-level drag & drop ────────────────────────────────────────────────
+
+  const onDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    if (!e.dataTransfer.types.includes("Files")) return;
+    dragCounter.current++;
+    setDragActive(true);
+  };
+  const onDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = Math.max(0, dragCounter.current - 1);
+    if (dragCounter.current === 0) setDragActive(false);
+  };
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = 0;
+    setDragActive(false);
+    if (e.dataTransfer.files?.length && upload.status !== "parsing") {
+      handleFiles(e.dataTransfer.files);
+    }
   };
 
-  const handleRemove = (id: string) => {
-    removeHolding(id);
-    setHoldings(loadHoldings());
+  // ── Actions ───────────────────────────────────────────────────────────────
+
+  const handleRemoveFile = (id: string) => {
+    const file = files.find((f) => f.id === id);
+    const label = file ? `"${file.fileName}"` : "file";
+    if (!confirm(`${label} remove karein? Iski holdings aur AI data bhi hat jayega.`)) return;
+    removePortfolioFile(id);
+    reloadData();
+  };
+
+  const handleClearAll = () => {
+    if (!confirm("Saari files aur portfolio data remove karein? Yeh undo nahi hoga.")) return;
+    clearPortfolio();
+    reloadData();
+  };
+
+  const goToChat = (prompt: string) => {
+    sessionStorage.setItem("arjunai_portfolio_prompt", prompt);
+    router.push("/");
   };
 
   const handleAnalyze = () => {
     const prompt = holdings.length
       ? buildPortfolioPrompt(priced, usdInr)
-      : "Analyze my uploaded portfolio document — explain allocation, risk, and suggest improvements.";
-    if (holdings.length) {
-      const fullContext = buildPortfolioAIContext(priced, usdInr);
-      savePortfolioAIContext(fullContext, { importedAt: new Date().toISOString(), format: "holdings" });
-    }
-    sessionStorage.setItem("arjunai_portfolio_prompt", prompt);
-    router.push("/");
+      : "Meri uploaded portfolio file analyze karo — allocation, risk aur improvements batao.";
+    goToChat(prompt);
   };
 
-  const handleClear = () => {
-    if (!confirm("Clear entire portfolio? This cannot be undone.")) return;
-    clearAllHoldings();
-    setHoldings([]); setPriced([]); setConnectedBroker(null); setSourceMeta(null); setHasAIContext(false);
+  const handleAsk = (question: string) => {
+    const q = question.trim();
+    if (!q) return;
+    goToChat(q);
   };
 
+  // ── Derived ───────────────────────────────────────────────────────────────
+
+  const summary = useMemo(() => calcSummary(priced), [priced]);
   const pnlPositive = summary.totalPnlINR >= 0;
+  const hasData = files.length > 0 || holdings.length > 0;
+
+  const chartSegments = useMemo(() => [
+    { label: "Stocks", value: summary.stocksValueINR, color: CHART_COLORS.stock },
+    { label: "Crypto", value: summary.cryptoValueINR, color: CHART_COLORS.crypto },
+    { label: "Mutual Funds", value: summary.mfValueINR, color: CHART_COLORS.mf },
+  ], [summary]);
+
   const filteredPriced = activeTab === "all" ? priced : priced.filter((h) => h.type === activeTab);
 
   const TABS = [
     { id: "all" as const, label: "All", count: priced.length },
-    { id: "stock" as const, label: "Stocks", count: priced.filter((h) => h.type === "stock").length, color: "#10b981" },
-    { id: "crypto" as const, label: "Crypto", count: priced.filter((h) => h.type === "crypto").length, color: "#f59e0b" },
-    { id: "mf" as const, label: "MF", count: priced.filter((h) => h.type === "mf").length, color: "#7c6ff7" },
+    { id: "stock" as const, label: "Stocks", count: priced.filter((h) => h.type === "stock").length, color: CHART_COLORS.stock },
+    { id: "crypto" as const, label: "Crypto", count: priced.filter((h) => h.type === "crypto").length, color: CHART_COLORS.crypto },
+    { id: "mf" as const, label: "MF", count: priced.filter((h) => h.type === "mf").length, color: CHART_COLORS.mf },
   ];
 
   return (
-    <div className="min-h-full" style={{ background: "#0a0a0f", color: "#f0f0f5" }}>
+    <div
+      className="h-full overflow-y-auto relative"
+      style={{ background: "#0a0a0f", color: "#f0f0f5" }}
+      onDragEnter={onDragEnter}
+      onDragOver={(e) => e.preventDefault()}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".csv,.txt,.xlsx,.xls,.pdf"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files?.length) handleFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
+
+      {/* Drag overlay */}
+      {dragActive && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none"
+          style={{ background: "rgba(10,10,15,0.85)", backdropFilter: "blur(4px)" }}
+        >
+          <div
+            className="rounded-3xl px-12 py-10 text-center border-2 border-dashed"
+            style={{ borderColor: "#7c6ff7", background: "#13131c" }}
+          >
+            <svg className="w-10 h-10 mx-auto mb-3" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+            <p className="text-base font-semibold">Portfolio file yahan drop karein</p>
+            <p className="text-xs mt-1" style={{ color: "#5a5a72" }}>CSV · Excel · PDF</p>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <header
@@ -204,210 +356,372 @@ export default function PortfolioPage() {
           <div>
             <h1 className="text-sm font-bold" style={{ color: "#f0f0f5" }}>My Portfolio</h1>
             <p className="text-xs" style={{ color: "#5a5a72" }}>
-              {holdings.length} holdings · USD/INR ₹{usdInr.toFixed(1)}
-              {connectedBroker && <span style={{ color: "#10b981" }}> · {connectedBroker.name}</span>}
+              {files.length} file{files.length === 1 ? "" : "s"} · {holdings.length} holdings
+              {holdings.length > 0 && <> · USD/INR ₹{usdInr.toFixed(1)}</>}
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          {sourceMeta?.fileName && (
-            <span className="hidden md:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg truncate max-w-[160px]"
-              style={{ background: "#1a1a25", color: "#9898b0", border: "1px solid #2a2a3a" }}>
-              <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-              {sourceMeta.fileName}
-            </span>
-          )}
-          <button onClick={() => setShowConnectModal(true)}
-            className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-            style={{ background: "#1a1a25", color: "#7c6ff7", border: "1px solid #7c6ff730" }}
-            onMouseEnter={(e) => { e.currentTarget.style.background = "#7c6ff715"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = "#1a1a25"; }}>
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-            </svg>
-            Connect Demat
-          </button>
-          <button
-            onClick={() => setRefreshKey((k) => k + 1)}
-            disabled={loadingPrices}
-            className="p-1.5 rounded-lg transition-all"
-            style={{ background: "#1a1a25", color: "#5a5a72", border: "1px solid #2a2a3a" }}
-            title="Refresh prices"
-            onMouseEnter={(e) => { e.currentTarget.style.color = "#f0f0f5"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "#5a5a72"; }}>
-            <svg className={`w-4 h-4 ${loadingPrices ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-          </button>
-          <button onClick={() => setShowAddModal(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
-            style={{ background: "linear-gradient(135deg, #6c5ce7, #7c6ff7)", color: "#fff", boxShadow: "0 4px 12px rgba(108,92,231,0.3)" }}>
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-            </svg>
-            Add Holding
-          </button>
           {holdings.length > 0 && (
-            <button onClick={handleClear}
-              className="p-1.5 rounded-lg transition-colors"
-              style={{ color: "#5a5a72" }}
-              title="Clear portfolio"
-              onMouseEnter={(e) => { e.currentTarget.style.color = "#f87171"; }}
+            <button
+              onClick={() => setRefreshKey((k) => k + 1)}
+              disabled={loadingPrices}
+              className="p-1.5 rounded-lg transition-all"
+              style={{ background: "#1a1a25", color: "#5a5a72", border: "1px solid #2a2a3a" }}
+              title="Refresh prices"
+              onMouseEnter={(e) => { e.currentTarget.style.color = "#f0f0f5"; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = "#5a5a72"; }}>
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              <svg className={`w-4 h-4 ${loadingPrices ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
           )}
+          <button
+            onClick={openFilePicker}
+            disabled={upload.status === "parsing"}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+            style={{
+              background: "linear-gradient(135deg, #6c5ce7, #7c6ff7)",
+              color: "#fff",
+              boxShadow: "0 4px 12px rgba(108,92,231,0.3)",
+              opacity: upload.status === "parsing" ? 0.6 : 1,
+            }}>
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+            Add File
+          </button>
         </div>
       </header>
 
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-5">
 
-        {/* ── Summary Cards ── */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <StatCard
-            label="Total Invested"
-            value={fmtINR(summary.totalInvestedINR)}
-            sub={`${holdings.length} positions`}
-            icon="💼"
-          />
-          <StatCard
-            label="Current Value"
-            value={fmtINR(summary.totalCurrentINR)}
-            sub={loadingPrices ? "Fetching live prices..." : "Live prices"}
-            icon="📈"
-          />
-          <StatCard
-            label="Overall P&L"
-            value={`${pnlPositive ? "+" : ""}${fmtINR(summary.totalPnlINR)}`}
-            sub={fmtPct(summary.totalPnlPct)}
-            color={pnlPositive ? "#10b981" : "#f87171"}
-            icon={pnlPositive ? "🟢" : "🔴"}
-          />
-        </div>
+        {/* ── Upload status banner ── */}
+        {upload.status !== "idle" && (
+          <div
+            className="flex items-center gap-2.5 px-4 py-3 rounded-xl text-sm"
+            style={
+              upload.status === "error"
+                ? { background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.2)", color: "#fca5a5" }
+                : upload.status === "success"
+                ? { background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.2)", color: "#34d399" }
+                : { background: "#13131c", border: "1px solid #2a2a3a", color: "#9898b0" }
+            }
+          >
+            {upload.status === "parsing" && (
+              <svg className="w-4 h-4 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            )}
+            <span className="flex-1 min-w-0">{upload.message}</span>
+            {upload.status !== "parsing" && (
+              <button onClick={() => setUpload({ status: "idle", message: "" })} className="flex-shrink-0 opacity-70 hover:opacity-100">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+        )}
 
-        {/* ── Allocation Panel ── */}
-        {(holdings.length > 0 || hasAIContext) && (
-          <div className="rounded-2xl p-5" style={{ background: "#13131c", border: "1px solid #1e1e2a" }}>
-            <div className="flex flex-col sm:flex-row items-center gap-6">
-              <DonutChart segments={chartSegments} total={summary.totalCurrentINR} size={130} />
+        {!hasData ? (
+          /* ── Empty state: file connect hero ── */
+          <>
+            <div className="card-elevated rounded-2xl p-8 sm:p-12 text-center">
+              <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-5"
+                style={{ background: "rgba(124,111,247,0.1)", border: "1px solid rgba(124,111,247,0.25)" }}>
+                <svg className="w-8 h-8" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              </div>
+              <h2 className="text-lg font-bold mb-2">Portfolio file se connect karein</h2>
+              <p className="text-sm max-w-md mx-auto mb-6" style={{ color: "#9898b0" }}>
+                Apne broker ka holdings ya statement file upload karo — Finowings AI usse padh kar
+                aapke portfolio ke har sawaal ka jawab dega.
+              </p>
 
-              <div className="flex-1 w-full space-y-3">
-                <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "#5a5a72" }}>Asset Allocation</p>
-                {chartSegments.filter((s) => s.value > 0).map((seg) => {
-                  const pct = summary.totalCurrentINR > 0 ? ((seg.value / summary.totalCurrentINR) * 100).toFixed(1) : "0";
-                  return (
-                    <div key={seg.label}>
-                      <div className="flex items-center justify-between text-sm mb-1">
-                        <div className="flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full" style={{ background: seg.color }} />
-                          <span style={{ color: "#a0a0b8" }}>{seg.label}</span>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <span className="text-xs" style={{ color: "#5a5a72" }}>{pct}%</span>
-                          <span className="font-medium text-sm">{fmtINR(seg.value)}</span>
-                        </div>
-                      </div>
-                      <div className="h-1 rounded-full" style={{ background: "#1a1a25" }}>
-                        <div className="h-full rounded-full transition-all duration-500"
-                          style={{ width: `${pct}%`, background: seg.color, opacity: 0.8 }} />
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => upload.status !== "parsing" && openFilePicker()}
+                onKeyDown={(e) => e.key === "Enter" && openFilePicker()}
+                className="max-w-lg mx-auto py-10 px-6 rounded-2xl border-2 border-dashed cursor-pointer transition-all"
+                style={{ borderColor: "#2a2a3a", background: "#0d0d14" }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#7c6ff760"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a3a"; }}
+              >
+                <svg className="w-8 h-8 mx-auto mb-3" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+                <p className="text-sm font-semibold mb-1">File yahan drop karein ya click karke select karein</p>
+                <p className="text-xs mb-4" style={{ color: "#5a5a72" }}>
+                  Zerodha, Groww, Upstox, Angel One — kisi bhi broker ka export chalega
+                </p>
+                <div className="flex items-center justify-center gap-2">
+                  {[
+                    { label: "CSV", color: "#7c6ff7" },
+                    { label: "Excel", color: "#10b981" },
+                    { label: "PDF", color: "#f87171" },
+                  ].map((f) => (
+                    <span key={f.label} className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                      style={{ background: `${f.color}12`, color: f.color, border: `1px solid ${f.color}30` }}>
+                      {f.label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* How it works */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              {[
+                { step: "1", title: "File upload karein", desc: "Broker se holdings/statement download karke yahan add karo", icon: "📄" },
+                { step: "2", title: "Data auto-parse hota hai", desc: "Holdings, quantity aur buy price file se nikal aate hain", icon: "⚡" },
+                { step: "3", title: "AI se poochhein", desc: "Diversification, risk, P&L — apne data par based jawab", icon: "✨" },
+              ].map((s) => (
+                <div key={s.step} className="card-elevated rounded-2xl p-5">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="w-6 h-6 rounded-lg flex items-center justify-center text-xs font-bold"
+                      style={{ background: "rgba(124,111,247,0.12)", color: "#7c6ff7" }}>{s.step}</span>
+                    <span className="text-base">{s.icon}</span>
+                  </div>
+                  <p className="text-sm font-semibold mb-1">{s.title}</p>
+                  <p className="text-xs leading-relaxed" style={{ color: "#5a5a72" }}>{s.desc}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-center gap-1.5">
+              <svg className="w-3.5 h-3.5" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+              <span className="text-xs" style={{ color: "#5a5a72" }}>
+                100% secure — aapka data sirf aapke browser mein rehta hai, kahin upload nahi hota
+              </span>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* ── Summary + Charts (sirf jab structured holdings hain) ── */}
+            {holdings.length > 0 ? (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <StatCard
+                    label="Total Invested"
+                    value={fmtINR(summary.totalInvestedINR)}
+                    sub={`${holdings.length} positions`}
+                    icon="💼"
+                  />
+                  <StatCard
+                    label="Current Value"
+                    value={fmtINR(summary.totalCurrentINR)}
+                    sub={loadingPrices ? "Fetching live prices..." : "Live prices"}
+                    icon="📈"
+                  />
+                  <StatCard
+                    label="Overall P&L"
+                    value={`${pnlPositive ? "+" : ""}${fmtINR(summary.totalPnlINR)}`}
+                    sub={fmtPct(summary.totalPnlPct)}
+                    color={pnlPositive ? "#10b981" : "#f87171"}
+                    icon={pnlPositive ? "🟢" : "🔴"}
+                  />
+                </div>
+
+                {/* ── Charts ── */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+                  <div className="card-elevated rounded-2xl p-5">
+                    <div className="mb-4">
+                      <SectionTitle>Asset Allocation</SectionTitle>
+                    </div>
+                    <div className="flex flex-col items-center gap-5">
+                      <DonutChart segments={chartSegments} total={summary.totalCurrentINR} size={150} />
+                      <div className="w-full space-y-3">
+                        {chartSegments.filter((s) => s.value > 0).map((seg) => {
+                          const pct = summary.totalCurrentINR > 0 ? ((seg.value / summary.totalCurrentINR) * 100).toFixed(1) : "0";
+                          return (
+                            <div key={seg.label}>
+                              <div className="flex items-center justify-between text-sm mb-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="w-2 h-2 rounded-full" style={{ background: seg.color }} />
+                                  <span style={{ color: "#a0a0b8" }}>{seg.label}</span>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                  <span className="text-xs" style={{ color: "#5a5a72" }}>{pct}%</span>
+                                  <span className="font-medium text-sm">{fmtINR(seg.value)}</span>
+                                </div>
+                              </div>
+                              <div className="h-1 rounded-full" style={{ background: "#1a1a25" }}>
+                                <div className="h-full rounded-full transition-all duration-500"
+                                  style={{ width: `${pct}%`, background: seg.color, opacity: 0.8 }} />
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
-                  );
-                })}
+                  </div>
+                  <PnlByHoldingChart holdings={priced} />
+                </div>
+                <TopHoldingsChart holdings={priced} />
+              </>
+            ) : (
+              /* Files hain par structured holdings nahi (PDF/document case) */
+              <div
+                className="flex items-start gap-3 rounded-2xl p-4 text-sm"
+                style={{ background: "rgba(124,111,247,0.06)", border: "1px solid rgba(124,111,247,0.2)", color: "#a0a0b8" }}
+              >
+                <svg className="w-4 h-4 mt-0.5 flex-shrink-0" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <p>
+                  File se structured holdings nahi mili, lekin document AI se connected hai —
+                  neeche se apne portfolio ke baare mein kuch bhi poochh sakte hain.
+                </p>
+              </div>
+            )}
 
+            {/* ── Ask AI ── */}
+            <section className="card-elevated rounded-2xl p-5 space-y-4"
+              style={{ backgroundImage: "linear-gradient(135deg, #16162a 0%, #13131c 100%)" }}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <svg className="w-4 h-4" style={{ color: "#7c6ff7" }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+                  </svg>
+                  <h2 className="text-sm font-bold">Apne portfolio se poochhein</h2>
+                </div>
+                <span className="text-xs hidden sm:block" style={{ color: "#5a5a72" }}>
+                  AI ke paas aapki files ka data hai
+                </span>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {AI_SUGGESTIONS.map((q) => (
+                  <button
+                    key={q}
+                    onClick={() => handleAsk(q)}
+                    className="text-xs px-3 py-2 rounded-xl text-left transition-all"
+                    style={{ background: "#1a1a25", color: "#a0a0b8", border: "1px solid #2a2a3a" }}
+                    onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#7c6ff750"; e.currentTarget.style.color = "#f0f0f5"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a3a"; e.currentTarget.style.color = "#a0a0b8"; }}
+                  >
+                    {q}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={askText}
+                  onChange={(e) => setAskText(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAsk(askText)}
+                  placeholder="Ya apna sawaal likhein — jaise 'IT stocks mein kitna paisa laga hai?'"
+                  className="flex-1 px-3.5 py-2.5 rounded-xl text-sm outline-none min-w-0"
+                  style={{ background: "#0d0d14", border: "1px solid #2a2a3a", color: "#f0f0f5" }}
+                  onFocus={(e) => (e.currentTarget.style.borderColor = "#7c6ff750")}
+                  onBlur={(e) => (e.currentTarget.style.borderColor = "#2a2a3a")}
+                />
+                <button
+                  onClick={() => handleAsk(askText)}
+                  disabled={!askText.trim()}
+                  className="px-4 py-2.5 rounded-xl text-sm font-semibold transition-all flex-shrink-0"
+                  style={{
+                    background: askText.trim() ? "linear-gradient(135deg, #6c5ce7, #7c6ff7)" : "#1a1a25",
+                    color: askText.trim() ? "#fff" : "#5a5a72",
+                  }}
+                >
+                  Ask AI
+                </button>
+              </div>
+
+              {holdings.length > 0 && (
                 <button
                   onClick={handleAnalyze}
-                  className="w-full mt-3 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-all"
+                  className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-all"
                   style={{ background: "linear-gradient(135deg, #6c5ce7, #7c6ff7)", color: "#fff", boxShadow: "0 4px 16px rgba(108,92,231,0.25)" }}
                   onMouseEnter={(e) => { e.currentTarget.style.boxShadow = "0 4px 24px rgba(108,92,231,0.45)"; }}
                   onMouseLeave={(e) => { e.currentTarget.style.boxShadow = "0 4px 16px rgba(108,92,231,0.25)"; }}>
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
                   </svg>
-                  Analyze with Finowings AI
+                  Full Portfolio Analysis with Finowings AI
                 </button>
-              </div>
-            </div>
-          </div>
-        )}
+              )}
+            </section>
 
-        {/* ── Holdings ── */}
-        {holdings.length === 0 ? (
-          <div className="rounded-2xl p-12 text-center" style={{ background: "#13131c", border: "1px dashed #2a2a3a" }}>
-            <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4"
-              style={{ background: "#1a1a25" }}>📊</div>
-            <h3 className="text-base font-semibold mb-2" style={{ color: "#f0f0f5" }}>
-              {sourceMeta?.fileName ? "No holdings found" : "Your portfolio is empty"}
-            </h3>
-            <p className="text-sm mb-6 max-w-sm mx-auto" style={{ color: "#5a5a72" }}>
-              {sourceMeta?.fileName
-                ? `Could not parse holdings from "${sourceMeta.fileName}". Try re-uploading an Order History or Holdings CSV.`
-                : "Connect your Demat account or add holdings manually to get started."}
-            </p>
-            <div className="flex flex-col sm:flex-row gap-3 justify-center">
-              <button onClick={() => setShowConnectModal(true)}
-                className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold"
-                style={{ background: "linear-gradient(135deg, #6c5ce7, #7c6ff7)", color: "#fff" }}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                </svg>
-                Connect Demat Account
-              </button>
-              <button onClick={() => setShowAddModal(true)}
-                className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium"
-                style={{ background: "#1a1a25", color: "#a0a0b8", border: "1px solid #2a2a3a" }}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                </svg>
-                Add Manually
-              </button>
-            </div>
-          </div>
-        ) : (
-          <>
-            {/* Tab filter */}
-            <div className="flex items-center gap-1 p-1 rounded-xl w-fit" style={{ background: "#13131c", border: "1px solid #1e1e2a" }}>
-              {TABS.filter((t) => t.count > 0 || t.id === "all").map((tab) => (
+            {/* ── Connected files ── */}
+            <section className="space-y-3">
+              <div className="flex items-center justify-between">
+                <SectionTitle>Connected Files ({files.length})</SectionTitle>
                 <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-                  style={{
-                    background: activeTab === tab.id ? "#2a2a3a" : "transparent",
-                    color: activeTab === tab.id ? (tab.color ?? "#f0f0f5") : "#5a5a72",
-                  }}>
-                  {tab.label}
-                  {tab.count > 0 && (
-                    <span className="px-1.5 py-0.5 rounded-full text-xs"
-                      style={{ background: activeTab === tab.id ? "#3a3a52" : "#1a1a25", color: activeTab === tab.id ? (tab.color ?? "#a0a0b8") : "#3a3a52" }}>
-                      {tab.count}
-                    </span>
-                  )}
-                </button>
-              ))}
-            </div>
-
-            {/* Holdings grid */}
-            {filteredPriced.length === 0 ? (
-              <div className="rounded-2xl p-8 text-center" style={{ background: "#13131c", border: "1px dashed #2a2a3a" }}>
-                <p className="text-sm" style={{ color: "#5a5a72" }}>No {activeTab} holdings yet.</p>
-                <button onClick={() => setShowAddModal(true)}
-                  className="mt-3 text-xs px-3 py-1.5 rounded-lg"
-                  style={{ color: "#7c6ff7", background: "rgba(124,111,247,0.1)" }}>
-                  + Add one
+                  onClick={handleClearAll}
+                  className="text-xs transition-colors"
+                  style={{ color: "#5a5a72" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = "#f87171")}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = "#5a5a72")}
+                >
+                  Clear all
                 </button>
               </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {filteredPriced.map((h) => (
-                  <HoldingCard key={h.id} holding={h} usdInr={usdInr} onRemove={handleRemove} />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {files.map((f) => (
+                  <FileCard key={f.id} file={f} onRemove={handleRemoveFile} />
                 ))}
+                {/* Add file tile */}
+                <button
+                  onClick={openFilePicker}
+                  disabled={upload.status === "parsing"}
+                  className="flex items-center justify-center gap-2 rounded-2xl p-3.5 border border-dashed text-sm transition-all min-h-[68px]"
+                  style={{ borderColor: "#2a2a3a", color: "#5a5a72", background: "transparent" }}
+                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#7c6ff760"; e.currentTarget.style.color = "#7c6ff7"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a3a"; e.currentTarget.style.color = "#5a5a72"; }}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                  </svg>
+                  Aur file add karein
+                </button>
               </div>
+            </section>
+
+            {/* ── Holdings ── */}
+            {holdings.length > 0 && (
+              <section className="space-y-4">
+                <div className="card-elevated flex items-center gap-1 p-1 rounded-xl w-fit">
+                  {TABS.filter((t) => t.count > 0 || t.id === "all").map((tab) => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setActiveTab(tab.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+                      style={{
+                        background: activeTab === tab.id ? "#2a2a3a" : "transparent",
+                        color: activeTab === tab.id ? (tab.color ?? "#f0f0f5") : "#5a5a72",
+                      }}>
+                      {tab.label}
+                      {tab.count > 0 && (
+                        <span className="px-1.5 py-0.5 rounded-full text-xs"
+                          style={{ background: activeTab === tab.id ? "#3a3a52" : "#1a1a25", color: activeTab === tab.id ? (tab.color ?? "#a0a0b8") : "#3a3a52" }}>
+                          {tab.count}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {filteredPriced.length === 0 ? (
+                  <div className="card-elevated rounded-2xl p-8 text-center" style={{ borderStyle: "dashed" }}>
+                    <p className="text-sm" style={{ color: "#5a5a72" }}>No {activeTab} holdings yet.</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {filteredPriced.map((h) => (
+                      <HoldingCard key={h.id} holding={h} usdInr={usdInr} />
+                    ))}
+                  </div>
+                )}
+              </section>
             )}
           </>
         )}
@@ -417,20 +731,6 @@ export default function PortfolioPage() {
           Prices: CoinGecko (crypto) · Yahoo Finance (stocks) · Manual (MF) · For reference only, not financial advice
         </p>
       </main>
-
-      {showConnectModal && (
-        <ConnectPortfolioModal
-          onClose={() => setShowConnectModal(false)}
-          onImported={(h) => {
-            setHoldings(h);
-            setConnectedBroker(loadConnectedBroker());
-            setSourceMeta(getPortfolioSourceMeta());
-            setHasAIContext(!!getPortfolioAIContext());
-          }}
-          onManualAdd={() => setShowAddModal(true)}
-        />
-      )}
-      {showAddModal && <AddHoldingModal onAdd={handleAdd} onClose={() => setShowAddModal(false)} />}
     </div>
   );
 }

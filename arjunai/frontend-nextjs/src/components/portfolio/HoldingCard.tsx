@@ -6,16 +6,16 @@ import { fmtINR, fmtPct } from "@/lib/portfolio";
 interface Props {
   holding: PricedHolding;
   usdInr: number;
-  onRemove: (id: string) => void;
 }
 
+// Type colors — PortfolioCharts ke validated palette se sync (stocks/crypto/mf har jagah same hue)
 const TYPE_CONFIG = {
-  stock: { icon: "📈", color: "#10b981", label: "Stock" },
-  crypto: { icon: "₿", color: "#f59e0b", label: "Crypto" },
+  stock: { icon: "📈", color: "#0ca678", label: "Stock" },
+  crypto: { icon: "₿", color: "#c98500", label: "Crypto" },
   mf: { icon: "🏦", color: "#7c6ff7", label: "MF" },
 };
 
-export default function HoldingCard({ holding: h, usdInr, onRemove }: Props) {
+export default function HoldingCard({ holding: h, usdInr }: Props) {
   const cfg = TYPE_CONFIG[h.type];
   const isPositive = h.pnlINR >= 0;
   const pnlColor = isPositive ? "#10b981" : "#f87171";
@@ -26,25 +26,10 @@ export default function HoldingCard({ holding: h, usdInr, onRemove }: Props) {
 
   return (
     <div
-      className="group relative rounded-2xl p-4 transition-all duration-150"
-      style={{ background: "#13131c", border: "1px solid #1e1e2a" }}
+      className="card-elevated group relative rounded-2xl p-4 transition-all duration-150"
       onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#2a2a3a")}
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#1e1e2a")}
     >
-      {/* Remove button */}
-      <button
-        onClick={() => onRemove(h.id)}
-        className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-lg"
-        style={{ color: "#5a5a72" }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = "#f87171"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = "#5a5a72"; }}
-        title="Remove holding"
-      >
-        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-        </svg>
-      </button>
-
       {/* Header */}
       <div className="flex items-start gap-3 mb-3">
         <div

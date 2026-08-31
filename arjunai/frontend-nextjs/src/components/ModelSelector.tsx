@@ -65,12 +65,7 @@ export default function ModelSelector({ models, selected, onChange, disabled }: 
 
       {open && (
         <div
-          className="absolute bottom-full left-0 mb-2 w-72 rounded-xl overflow-hidden z-30 fade-in"
-          style={{
-            background: "#141414",
-            border: "1px solid #2a2a2a",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.5)",
-          }}
+          className="absolute bottom-full left-0 mb-2 w-72 rounded-xl overflow-hidden z-30 fade-in card-elevated"
         >
           <div className="px-3 py-2" style={{ borderBottom: "1px solid #222222" }}>
             <p className="text-xs font-medium" style={{ color: "#666666" }}>AI Model choose karein</p>

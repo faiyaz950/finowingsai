@@ -153,8 +153,7 @@ export default function ChatInput({ onSend, disabled, placeholder }: Props) {
           {attachments.map((att) => (
             <div
               key={att.id}
-              className="relative flex-shrink-0 rounded-lg overflow-hidden group"
-              style={{ background: "#161616", border: "1px solid #222222" }}
+              className="card-elevated relative flex-shrink-0 rounded-lg overflow-hidden group"
             >
               {att.type === "image" ? (
                 <img
@@ -213,10 +212,10 @@ export default function ChatInput({ onSend, disabled, placeholder }: Props) {
 
       {/* Input box */}
       <div
-        className="relative rounded-xl border transition-colors duration-150"
+        className="card-elevated relative rounded-xl transition-colors duration-150"
         style={{
-          background: "#111111",
-          borderColor: canSend ? "#444444" : "#222222",
+          backgroundColor: "#111111",
+          borderColor: canSend ? "#444444" : undefined,
         }}
       >
         <textarea
