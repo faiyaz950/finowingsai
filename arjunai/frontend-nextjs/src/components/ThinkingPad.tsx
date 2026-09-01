@@ -38,15 +38,15 @@ export default function ThinkingPad({
 
   const realSteps = steps.filter((s) => s.trim().length > 0);
   const stepCount = realSteps.length;
-  const live = liveRef.current && !reduceMotion;
+  const animateLive = liveRef.current && !reduceMotion;
 
   const [expanded, setExpanded] = useState(defaultExpanded);
-  const [doneCount, setDoneCount] = useState(() => (live ? 0 : stepCount));
+  const [doneCount, setDoneCount] = useState(() => (animateLive ? 0 : stepCount));
   const [typed, setTyped] = useState("");
   const currentFull = realSteps[doneCount] ?? "";
 
   useEffect(() => {
-    if (!live) {
+    if (!animateLive) {
       setDoneCount(stepCount);
       setTyped("");
       return;
@@ -71,11 +71,11 @@ export default function ThinkingPad({
       setTyped((prev) => nextStepChunk(prev, currentFull));
     }, 22);
     return () => window.clearTimeout(t);
-  }, [live, stepCount, currentFull, doneCount, typed]);
+  }, [animateLive, stepCount, currentFull, doneCount, typed]);
 
   const allTyped = realSteps.length > 0 && doneCount >= realSteps.length;
-  const working = isActive || (live && !allTyped);
-  const stillRevealing = live && !allTyped;
+  const working = isActive || (animateLive && !allTyped);
+  const stillRevealing = animateLive && !allTyped;
 
   useEffect(() => {
     if (completedRef.current) return;
